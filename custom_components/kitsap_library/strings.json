@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Kitsap Regional Library",
+        "description": "Enter your KRL card number (or username) and PIN to connect your account.",
+        "data": {
+          "username": "Card Number / Username",
+          "password": "PIN / Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid credentials. Check your card number and PIN.",
+      "cannot_connect": "Could not reach the library catalog. Check your network connection.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This library account is already configured."
+    }
+  }
+}
