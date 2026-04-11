@@ -20,7 +20,7 @@ from .const import (
     SENSOR_NEXT_DUE_DATE,
     SENSOR_OVERDUE_ITEMS,
 )
-from .coordinator import KitsapLibraryCoordinator, LibraryData
+from .coordinator import KitsapLibraryCoordinator, LibraryData, LibraryItem
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,14 +33,35 @@ async def async_setup_entry(
     coordinator: KitsapLibraryCoordinator = hass.data[DOMAIN][entry.entry_id]
     username = entry.data[CONF_USERNAME]
 
-    async_add_entities(
-        [
-            ItemsCheckedOutSensor(coordinator, entry, username),
-            NextDueDateSensor(coordinator, entry, username),
-            OverdueItemsSensor(coordinator, entry, username),
-            HoldsReadySensor(coordinator, entry, username),
-            HoldsWaitingSensor(coordinator, entry, username),
-        ]
+    # Track which per-book sensors exist so we can add/remove dynamically
+    known_checkout_ids: set[str] = set()
+
+    summary_sensors = [
+        ItemsCheckedOutSensor(coordinator, entry, username),
+        NextDueDateSensor(coordinator, entry, username),
+        OverdueItemsSensor(coordinator, entry, username),
+        HoldsReadySensor(coordinator, entry, username),
+        HoldsWaitingSensor(coordinator, entry, username),
+    ]
+    async_add_entities(summary_sensors)
+
+    def _add_new_book_sensors() -> None:
+        if coordinator.data is None:
+            return
+        new_entities = []
+        for item in coordinator.data.checkouts:
+            if item.checkout_id not in known_checkout_ids:
+                known_checkout_ids.add(item.checkout_id)
+                new_entities.append(BookSensor(coordinator, entry, username, item.checkout_id))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    # Add sensors for books already present at startup
+    _add_new_book_sensors()
+
+    # Add sensors for newly checked-out books on each coordinator update
+    entry.async_on_unload(
+        coordinator.async_add_listener(_add_new_book_sensors)
     )
 
 
@@ -76,7 +97,6 @@ class ItemsCheckedOutSensor(KitsapLibrarySensor):
     """Number of currently checked-out items."""
 
     _attr_icon = "mdi:book-open-variant"
-    _attr_translation_key = SENSOR_ITEMS_CHECKED_OUT
 
     def __init__(self, coordinator, entry, username):
         super().__init__(coordinator, entry, username, SENSOR_ITEMS_CHECKED_OUT)
@@ -98,11 +118,14 @@ class ItemsCheckedOutSensor(KitsapLibrarySensor):
         return {
             "items": [
                 {
+                    "checkout_id": item.checkout_id,
                     "title": item.title,
                     "subtitle": item.subtitle,
                     "medium": item.medium,
                     "due_date": item.due_date.isoformat(),
                     "overdue": item.overdue,
+                    "assigned_to": item.assigned_to,
+                    "image_url": item.image_url,
                 }
                 for item in self.data.checkouts
             ]
@@ -128,19 +151,30 @@ class NextDueDateSensor(KitsapLibrarySensor):
         return due.isoformat() if due else None
 
     @property
+    def entity_picture(self) -> str | None:
+        """Show the cover of the soonest-due item."""
+        item = self.data.next_due_item
+        return item.image_url if item else None
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        due = self.data.next_due_date
-        if due is None:
+        item = self.data.next_due_item
+        if item is None:
             return {}
-        days_until = (due - datetime.date.today()).days
-        items_due_soon = [
-            item.title
-            for item in self.data.checkouts
-            if item.due_date == due
-        ]
+        days_until = (item.due_date - datetime.date.today()).days
         return {
+            "title": item.title,
+            "subtitle": item.subtitle,
+            "medium": item.medium,
+            "checkout_id": item.checkout_id,
+            "assigned_to": item.assigned_to,
+            "image_url": item.image_url,
             "days_until_due": days_until,
-            "items_due": items_due_soon,
+            "items_due": [
+                i.title
+                for i in self.data.checkouts
+                if i.due_date == item.due_date
+            ],
         }
 
 
@@ -169,9 +203,12 @@ class OverdueItemsSensor(KitsapLibrarySensor):
         return {
             "items": [
                 {
+                    "checkout_id": item.checkout_id,
                     "title": item.title,
                     "due_date": item.due_date.isoformat(),
                     "days_overdue": (datetime.date.today() - item.due_date).days,
+                    "assigned_to": item.assigned_to,
+                    "image_url": item.image_url,
                 }
                 for item in self.data.checkouts
                 if item.overdue
@@ -242,4 +279,75 @@ class HoldsWaitingSensor(KitsapLibrarySensor):
                 for h in self.data.holds
                 if h.status != "READY"
             ]
+        }
+
+
+class BookSensor(KitsapLibrarySensor):
+    """One sensor per checked-out book showing cover, due date, and assignment.
+
+    The sensor becomes unavailable once the book is returned (checkout_id
+    disappears from the coordinator data). HA will automatically hide
+    unavailable entities after a configurable grace period.
+    """
+
+    _attr_icon = "mdi:book"
+
+    def __init__(
+        self,
+        coordinator: KitsapLibraryCoordinator,
+        entry: ConfigEntry,
+        username: str,
+        checkout_id: str,
+    ) -> None:
+        super().__init__(coordinator, entry, username, f"book_{checkout_id}")
+        self._checkout_id = checkout_id
+
+    def _current_item(self) -> LibraryItem | None:
+        if self.coordinator.data is None:
+            return None
+        for item in self.coordinator.data.checkouts:
+            if item.checkout_id == self._checkout_id:
+                return item
+        return None
+
+    @property
+    def name(self) -> str:
+        item = self._current_item()
+        return item.title if item else f"Book {self._checkout_id}"
+
+    @property
+    def available(self) -> bool:
+        return self._current_item() is not None
+
+    @property
+    def native_value(self) -> str | None:
+        item = self._current_item()
+        return item.due_date.isoformat() if item else None
+
+    @property
+    def device_class(self) -> str:
+        return "date"
+
+    @property
+    def entity_picture(self) -> str | None:
+        item = self._current_item()
+        return item.image_url if item else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        item = self._current_item()
+        if item is None:
+            return {}
+        days_until = (item.due_date - datetime.date.today()).days
+        return {
+            "checkout_id": item.checkout_id,
+            "title": item.title,
+            "subtitle": item.subtitle,
+            "medium": item.medium,
+            "due_date": item.due_date.isoformat(),
+            "days_until_due": days_until,
+            "overdue": item.overdue,
+            "assigned_to": item.assigned_to,
+            "image_url": item.image_url,
+            "isbn": item.isbn,
         }

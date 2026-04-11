@@ -18,5 +18,31 @@
     "abort": {
       "already_configured": "This library account is already configured."
     }
+  },
+  "services": {
+    "assign_item": {
+      "name": "Assign Item to Person",
+      "description": "Assign a checked-out item to a household member. Automatically removed when the item is returned.",
+      "fields": {
+        "checkout_id": {
+          "name": "Checkout ID",
+          "description": "Found in the 'items' attribute of the Items Checked Out sensor."
+        },
+        "person": {
+          "name": "Person",
+          "description": "Name of the household member who has this item."
+        }
+      }
+    },
+    "unassign_item": {
+      "name": "Unassign Item",
+      "description": "Remove the household assignment from a checked-out item.",
+      "fields": {
+        "checkout_id": {
+          "name": "Checkout ID",
+          "description": "Found in the 'items' attribute of the Items Checked Out sensor."
+        }
+      }
+    }
   }
 }
