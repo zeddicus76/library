@@ -1,0 +1,34 @@
+assign_item:
+  name: Assign Item to Person
+  description: >
+    Assign a checked-out library item to a household member. The assignment
+    persists across restarts and is automatically removed when the item is returned.
+  fields:
+    checkout_id:
+      name: Checkout ID
+      description: >
+        The checkout ID of the item to assign. Find this in the `items` attribute
+        of the "Items Checked Out" sensor.
+      required: true
+      example: "abc123"
+      selector:
+        text:
+    person:
+      name: Person
+      description: The name of the household member who has this item.
+      required: true
+      example: "Emma"
+      selector:
+        text:
+
+unassign_item:
+  name: Unassign Item
+  description: Remove the household assignment from a checked-out library item.
+  fields:
+    checkout_id:
+      name: Checkout ID
+      description: The checkout ID of the item to unassign.
+      required: true
+      example: "abc123"
+      selector:
+        text:

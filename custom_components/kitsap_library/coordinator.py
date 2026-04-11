@@ -6,7 +6,7 @@ import datetime
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant
@@ -21,9 +21,14 @@ from .const import (
     SCAN_INTERVAL_HOURS,
 )
 
+if TYPE_CHECKING:
+    from .storage import AssignmentStore
+
 _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = datetime.timedelta(hours=SCAN_INTERVAL_HOURS)
+
+OPEN_LIBRARY_COVER = "https://covers.openlibrary.org/b/isbn/{isbn}-M.jpg"
 
 
 @dataclass
@@ -35,6 +40,9 @@ class LibraryItem:
     subtitle: str | None
     medium: str
     due_date: datetime.date
+    isbn: str | None = None
+    image_url: str | None = None
+    assigned_to: str | None = None
     overdue: bool = field(init=False)
 
     def __post_init__(self) -> None:
@@ -74,6 +82,12 @@ class LibraryData:
         return min(item.due_date for item in self.checkouts)
 
     @property
+    def next_due_item(self) -> LibraryItem | None:
+        if not self.checkouts:
+            return None
+        return min(self.checkouts, key=lambda x: x.due_date)
+
+    @property
     def holds_ready(self) -> int:
         return sum(1 for h in self.holds if h.status == "READY")
 
@@ -92,6 +106,24 @@ def _translate_medium(medium: str) -> str:
         "MUSIC_CD": "music cd",
         "MAGAZINE": "magazine",
     }.get(medium, medium.lower().replace("_", " "))
+
+
+def _extract_image_url(brief: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return (isbn, image_url) from a briefInfo dict."""
+    isbns: list[str] = brief.get("isbns") or []
+    isbn = isbns[0] if isbns else None
+
+    # BiblioCommons may provide a jacket image directly
+    jacket = brief.get("jacket") or {}
+    image_url: str | None = None
+    if isinstance(jacket, dict):
+        image_url = jacket.get("small") or jacket.get("medium") or jacket.get("large")
+
+    # Fall back to Open Library cover if we have an ISBN
+    if not image_url and isbn:
+        image_url = OPEN_LIBRARY_COVER.format(isbn=isbn)
+
+    return isbn, image_url
 
 
 class KitsapLibraryClient:
@@ -116,9 +148,7 @@ class KitsapLibraryClient:
         session = await self._get_session()
 
         # Step 1: Get the login page and extract the CSRF token
-        async with session.get(
-            LOGIN_URL, params={"destination": "x"}
-        ) as resp:
+        async with session.get(LOGIN_URL, params={"destination": "x"}) as resp:
             if resp.status != 200:
                 raise ConfigEntryAuthFailed(
                     f"Login page returned HTTP {resp.status}"
@@ -140,9 +170,7 @@ class KitsapLibraryClient:
             "name": self._username,
             "user_pin": self._password,
         }
-        async with session.post(
-            LOGIN_URL, data=data, allow_redirects=True
-        ) as resp:
+        async with session.post(LOGIN_URL, data=data, allow_redirects=True) as resp:
             if resp.status != 200:
                 raise ConfigEntryAuthFailed(
                     f"Login POST returned HTTP {resp.status}"
@@ -171,71 +199,53 @@ class KitsapLibraryClient:
             "X-Session-Id": self._session_id or "",
         }
 
-    async def get_checkouts(self) -> list[LibraryItem]:
-        """Fetch current checkouts."""
+    async def _get_json(self, url: str) -> dict[str, Any] | None:
+        """GET a gateway URL, re-authenticating once on 401."""
         if self._account_id is None:
             await self.authenticate()
 
         session = await self._get_session()
         params = {"accountId": self._account_id}
 
-        async with session.get(
-            CHECKOUTS_URL, params=params, headers=self._api_headers()
-        ) as resp:
+        async with session.get(url, params=params, headers=self._api_headers()) as resp:
             if resp.status == 401:
-                # Token expired — re-authenticate once
                 await self.authenticate()
                 async with session.get(
-                    CHECKOUTS_URL, params={"accountId": self._account_id},
-                    headers=self._api_headers()
+                    url,
+                    params={"accountId": self._account_id},
+                    headers=self._api_headers(),
                 ) as retry:
+                    if retry.status in (404, 501):
+                        return None
                     retry.raise_for_status()
-                    data = await retry.json()
-            else:
-                resp.raise_for_status()
-                data = await resp.json()
+                    return await retry.json()
+            if resp.status in (404, 501):
+                return None
+            resp.raise_for_status()
+            return await resp.json()
 
-        return _parse_checkouts(data)
+    async def get_checkouts(self, assignments: dict[str, str]) -> list[LibraryItem]:
+        """Fetch current checkouts and merge in household assignments."""
+        data = await self._get_json(CHECKOUTS_URL)
+        return _parse_checkouts(data or {}, assignments)
 
     async def get_holds(self) -> list[LibraryHold]:
         """Fetch current holds. Returns empty list if endpoint unavailable."""
-        if self._account_id is None:
-            await self.authenticate()
-
-        session = await self._get_session()
-        params = {"accountId": self._account_id}
-
         try:
-            async with session.get(
-                HOLDS_URL, params=params, headers=self._api_headers()
-            ) as resp:
-                if resp.status in (404, 501):
-                    return []
-                if resp.status == 401:
-                    await self.authenticate()
-                    async with session.get(
-                        HOLDS_URL, params={"accountId": self._account_id},
-                        headers=self._api_headers()
-                    ) as retry:
-                        if retry.status in (404, 501):
-                            return []
-                        retry.raise_for_status()
-                        data = await retry.json()
-                else:
-                    resp.raise_for_status()
-                    data = await resp.json()
+            data = await self._get_json(HOLDS_URL)
         except (aiohttp.ClientError, asyncio.TimeoutError):
             _LOGGER.debug("Holds endpoint unavailable")
             return []
-
-        return _parse_holds(data)
+        return _parse_holds(data or {})
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
 
 
-def _parse_checkouts(data: dict[str, Any]) -> list[LibraryItem]:
+def _parse_checkouts(
+    data: dict[str, Any], assignments: dict[str, str]
+) -> list[LibraryItem]:
     items: list[LibraryItem] = []
     entities = data.get("entities", {})
     checkouts = entities.get("checkouts", {})
@@ -246,14 +256,19 @@ def _parse_checkouts(data: dict[str, Any]) -> list[LibraryItem]:
             bib = bibs.get(checkout.get("metadataId"), {})
             brief = bib.get("briefInfo", {})
             due_str = checkout.get("dueDate", "")
-            due = datetime.date.fromisoformat(due_str[:10])  # handle datetime strings
+            due = datetime.date.fromisoformat(due_str[:10])
+            checkout_id = checkout.get("checkoutId", "")
+            isbn, image_url = _extract_image_url(brief)
             items.append(
                 LibraryItem(
-                    checkout_id=checkout.get("checkoutId", ""),
+                    checkout_id=checkout_id,
                     title=brief.get("title", "Unknown"),
                     subtitle=brief.get("subtitle"),
                     medium=_translate_medium(brief.get("format", "")),
                     due_date=due,
+                    isbn=isbn,
+                    image_url=image_url,
+                    assigned_to=assignments.get(checkout_id),
                 )
             )
         except (KeyError, ValueError) as exc:
@@ -275,9 +290,7 @@ def _parse_holds(data: dict[str, Any]) -> list[LibraryHold]:
             status = hold.get("status", "UNKNOWN")
             expires_str = hold.get("expiryDate") or hold.get("pickupByDate")
             expires = (
-                datetime.date.fromisoformat(expires_str[:10])
-                if expires_str
-                else None
+                datetime.date.fromisoformat(expires_str[:10]) if expires_str else None
             )
             holds.append(
                 LibraryHold(
@@ -301,6 +314,7 @@ class KitsapLibraryCoordinator(DataUpdateCoordinator[LibraryData]):
         self,
         hass: HomeAssistant,
         client: KitsapLibraryClient,
+        assignment_store: AssignmentStore,
     ) -> None:
         super().__init__(
             hass,
@@ -309,11 +323,13 @@ class KitsapLibraryCoordinator(DataUpdateCoordinator[LibraryData]):
             update_interval=UPDATE_INTERVAL,
         )
         self.client = client
+        self.assignment_store = assignment_store
 
     async def _async_update_data(self) -> LibraryData:
+        assignments = self.assignment_store.all()
         try:
             checkouts, holds = await asyncio.gather(
-                self.client.get_checkouts(),
+                self.client.get_checkouts(assignments),
                 self.client.get_holds(),
             )
         except ConfigEntryAuthFailed:
@@ -322,5 +338,9 @@ class KitsapLibraryCoordinator(DataUpdateCoordinator[LibraryData]):
             raise UpdateFailed(f"API error: {exc.status} {exc.message}") from exc
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise UpdateFailed(f"Network error: {exc}") from exc
+
+        # Clean up assignments for books that have been returned
+        active_ids = {item.checkout_id for item in checkouts}
+        await self.assignment_store.async_cleanup(active_ids)
 
         return LibraryData(checkouts=checkouts, holds=holds)
