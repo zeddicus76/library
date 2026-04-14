@@ -5,7 +5,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 STORAGE_VERSION = 1
-STORAGE_KEY_PREFIX = "kitsap_library.assignments"
+STORAGE_KEY_PREFIX = "bibliocommons.assignments"
 
 
 class AssignmentStore:

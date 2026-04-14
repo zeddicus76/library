@@ -8,7 +8,7 @@ assign_item:
       name: Checkout ID
       description: >
         The checkout ID of the item to assign. Find this in the `items` attribute
-        of the "Items Checked Out" sensor.
+        of the "Items Checked Out" sensor, or in any individual book sensor's attributes.
       required: true
       example: "abc123"
       selector:
@@ -17,7 +17,7 @@ assign_item:
       name: Person
       description: The name of the household member who has this item.
       required: true
-      example: "Emma"
+      example: "Gavin"
       selector:
         text:
 

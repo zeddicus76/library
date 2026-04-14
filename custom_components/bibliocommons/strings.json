@@ -2,9 +2,10 @@
   "config": {
     "step": {
       "user": {
-        "title": "Kitsap Regional Library",
-        "description": "Enter your KRL card number (or username) and PIN to connect your account.",
+        "title": "BiblioCommons Library",
+        "description": "Enter your library's BiblioCommons subdomain and your account credentials. Find your library's subdomain at [bibliocommons.com/libraries-we-work-with]({libraries_url}) — it is the part before `.bibliocommons.com` in your catalog URL (e.g. `krl` for Kitsap Regional Library).",
         "data": {
+          "library_subdomain": "Library Subdomain",
           "username": "Card Number / Username",
           "password": "PIN / Password"
         }
@@ -12,7 +13,7 @@
     },
     "error": {
       "invalid_auth": "Invalid credentials. Check your card number and PIN.",
-      "cannot_connect": "Could not reach the library catalog. Check your network connection.",
+      "cannot_connect": "Could not reach the library catalog. Check the subdomain and your network connection.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {
