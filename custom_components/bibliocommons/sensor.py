@@ -1,4 +1,4 @@
-"""Sensor entities for Kitsap Regional Library."""
+"""Sensor entities for the BiblioCommons Library integration."""
 from __future__ import annotations
 
 import datetime
@@ -12,6 +12,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CONF_LIBRARY_NAME,
+    CONF_LIBRARY_SUBDOMAIN,
     CONF_USERNAME,
     DOMAIN,
     SENSOR_HOLDS_READY,
@@ -20,7 +22,7 @@ from .const import (
     SENSOR_NEXT_DUE_DATE,
     SENSOR_OVERDUE_ITEMS,
 )
-from .coordinator import KitsapLibraryCoordinator, LibraryData, LibraryItem
+from .coordinator import BiblioCommonsCoordinator, LibraryData, LibraryItem
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,20 +32,19 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: KitsapLibraryCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator: BiblioCommonsCoordinator = hass.data[DOMAIN][entry.entry_id]
+    library_name = entry.data.get(CONF_LIBRARY_NAME, entry.data[CONF_LIBRARY_SUBDOMAIN].upper())
     username = entry.data[CONF_USERNAME]
 
-    # Track which per-book sensors exist so we can add/remove dynamically
     known_checkout_ids: set[str] = set()
 
-    summary_sensors = [
-        ItemsCheckedOutSensor(coordinator, entry, username),
-        NextDueDateSensor(coordinator, entry, username),
-        OverdueItemsSensor(coordinator, entry, username),
-        HoldsReadySensor(coordinator, entry, username),
-        HoldsWaitingSensor(coordinator, entry, username),
-    ]
-    async_add_entities(summary_sensors)
+    async_add_entities([
+        ItemsCheckedOutSensor(coordinator, entry, library_name, username),
+        NextDueDateSensor(coordinator, entry, library_name, username),
+        OverdueItemsSensor(coordinator, entry, library_name, username),
+        HoldsReadySensor(coordinator, entry, library_name, username),
+        HoldsWaitingSensor(coordinator, entry, library_name, username),
+    ])
 
     def _add_new_book_sensors() -> None:
         if coordinator.data is None:
@@ -52,39 +53,38 @@ async def async_setup_entry(
         for item in coordinator.data.checkouts:
             if item.checkout_id not in known_checkout_ids:
                 known_checkout_ids.add(item.checkout_id)
-                new_entities.append(BookSensor(coordinator, entry, username, item.checkout_id))
+                new_entities.append(
+                    BookSensor(coordinator, entry, library_name, username, item.checkout_id)
+                )
         if new_entities:
             async_add_entities(new_entities)
 
-    # Add sensors for books already present at startup
     _add_new_book_sensors()
-
-    # Add sensors for newly checked-out books on each coordinator update
-    entry.async_on_unload(
-        coordinator.async_add_listener(_add_new_book_sensors)
-    )
+    entry.async_on_unload(coordinator.async_add_listener(_add_new_book_sensors))
 
 
-class KitsapLibrarySensor(CoordinatorEntity[KitsapLibraryCoordinator], SensorEntity):
-    """Base class for Kitsap Library sensors."""
+class BiblioCommonsSensor(CoordinatorEntity[BiblioCommonsCoordinator], SensorEntity):
+    """Base class for BiblioCommons sensors."""
 
     _attr_has_entity_name = True
 
     def __init__(
         self,
-        coordinator: KitsapLibraryCoordinator,
+        coordinator: BiblioCommonsCoordinator,
         entry: ConfigEntry,
+        library_name: str,
         username: str,
         sensor_key: str,
     ) -> None:
         super().__init__(coordinator)
         self._username = username
+        self._library_name = library_name
         self._attr_unique_id = f"{entry.entry_id}_{sensor_key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": f"KRL – {username}",
-            "manufacturer": "Kitsap Regional Library",
-            "model": "BiblioCommons",
+            "name": f"{library_name} – {username}",
+            "manufacturer": "BiblioCommons",
+            "model": "Library Account",
             "entry_type": "service",
         }
 
@@ -93,13 +93,11 @@ class KitsapLibrarySensor(CoordinatorEntity[KitsapLibraryCoordinator], SensorEnt
         return self.coordinator.data
 
 
-class ItemsCheckedOutSensor(KitsapLibrarySensor):
-    """Number of currently checked-out items."""
-
+class ItemsCheckedOutSensor(BiblioCommonsSensor):
     _attr_icon = "mdi:book-open-variant"
 
-    def __init__(self, coordinator, entry, username):
-        super().__init__(coordinator, entry, username, SENSOR_ITEMS_CHECKED_OUT)
+    def __init__(self, coordinator, entry, library_name, username):
+        super().__init__(coordinator, entry, library_name, username, SENSOR_ITEMS_CHECKED_OUT)
 
     @property
     def name(self) -> str:
@@ -132,14 +130,12 @@ class ItemsCheckedOutSensor(KitsapLibrarySensor):
         }
 
 
-class NextDueDateSensor(KitsapLibrarySensor):
-    """Date of the soonest-due item."""
-
+class NextDueDateSensor(BiblioCommonsSensor):
     _attr_icon = "mdi:calendar-clock"
     _attr_device_class = "date"
 
-    def __init__(self, coordinator, entry, username):
-        super().__init__(coordinator, entry, username, SENSOR_NEXT_DUE_DATE)
+    def __init__(self, coordinator, entry, library_name, username):
+        super().__init__(coordinator, entry, library_name, username, SENSOR_NEXT_DUE_DATE)
 
     @property
     def name(self) -> str:
@@ -152,7 +148,6 @@ class NextDueDateSensor(KitsapLibrarySensor):
 
     @property
     def entity_picture(self) -> str | None:
-        """Show the cover of the soonest-due item."""
         item = self.data.next_due_item
         return item.image_url if item else None
 
@@ -170,21 +165,15 @@ class NextDueDateSensor(KitsapLibrarySensor):
             "assigned_to": item.assigned_to,
             "image_url": item.image_url,
             "days_until_due": days_until,
-            "items_due": [
-                i.title
-                for i in self.data.checkouts
-                if i.due_date == item.due_date
-            ],
+            "items_due": [i.title for i in self.data.checkouts if i.due_date == item.due_date],
         }
 
 
-class OverdueItemsSensor(KitsapLibrarySensor):
-    """Number of overdue items."""
-
+class OverdueItemsSensor(BiblioCommonsSensor):
     _attr_icon = "mdi:book-alert"
 
-    def __init__(self, coordinator, entry, username):
-        super().__init__(coordinator, entry, username, SENSOR_OVERDUE_ITEMS)
+    def __init__(self, coordinator, entry, library_name, username):
+        super().__init__(coordinator, entry, library_name, username, SENSOR_OVERDUE_ITEMS)
 
     @property
     def name(self) -> str:
@@ -216,13 +205,11 @@ class OverdueItemsSensor(KitsapLibrarySensor):
         }
 
 
-class HoldsReadySensor(KitsapLibrarySensor):
-    """Number of holds ready for pickup."""
-
+class HoldsReadySensor(BiblioCommonsSensor):
     _attr_icon = "mdi:package-variant"
 
-    def __init__(self, coordinator, entry, username):
-        super().__init__(coordinator, entry, username, SENSOR_HOLDS_READY)
+    def __init__(self, coordinator, entry, library_name, username):
+        super().__init__(coordinator, entry, library_name, username, SENSOR_HOLDS_READY)
 
     @property
     def name(self) -> str:
@@ -251,13 +238,11 @@ class HoldsReadySensor(KitsapLibrarySensor):
         }
 
 
-class HoldsWaitingSensor(KitsapLibrarySensor):
-    """Number of holds still in the queue."""
-
+class HoldsWaitingSensor(BiblioCommonsSensor):
     _attr_icon = "mdi:clock-outline"
 
-    def __init__(self, coordinator, entry, username):
-        super().__init__(coordinator, entry, username, SENSOR_HOLDS_WAITING)
+    def __init__(self, coordinator, entry, library_name, username):
+        super().__init__(coordinator, entry, library_name, username, SENSOR_HOLDS_WAITING)
 
     @property
     def name(self) -> str:
@@ -282,33 +267,32 @@ class HoldsWaitingSensor(KitsapLibrarySensor):
         }
 
 
-class BookSensor(KitsapLibrarySensor):
-    """One sensor per checked-out book showing cover, due date, and assignment.
+class BookSensor(BiblioCommonsSensor):
+    """One sensor per checked-out book — shows cover, due date, and assignment.
 
-    The sensor becomes unavailable once the book is returned (checkout_id
-    disappears from the coordinator data). HA will automatically hide
-    unavailable entities after a configurable grace period.
+    Becomes unavailable when the book is returned.
     """
 
     _attr_icon = "mdi:book"
 
     def __init__(
         self,
-        coordinator: KitsapLibraryCoordinator,
+        coordinator: BiblioCommonsCoordinator,
         entry: ConfigEntry,
+        library_name: str,
         username: str,
         checkout_id: str,
     ) -> None:
-        super().__init__(coordinator, entry, username, f"book_{checkout_id}")
+        super().__init__(coordinator, entry, library_name, username, f"book_{checkout_id}")
         self._checkout_id = checkout_id
 
     def _current_item(self) -> LibraryItem | None:
         if self.coordinator.data is None:
             return None
-        for item in self.coordinator.data.checkouts:
-            if item.checkout_id == self._checkout_id:
-                return item
-        return None
+        return next(
+            (i for i in self.coordinator.data.checkouts if i.checkout_id == self._checkout_id),
+            None,
+        )
 
     @property
     def name(self) -> str:

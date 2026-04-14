@@ -1,4 +1,4 @@
-"""Data coordinator for Kitsap Regional Library."""
+"""Data coordinator for BiblioCommons library integration."""
 from __future__ import annotations
 
 import asyncio
@@ -14,11 +14,11 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    CHECKOUTS_URL,
     DOMAIN,
-    HOLDS_URL,
-    LOGIN_URL,
     SCAN_INTERVAL_HOURS,
+    checkouts_url,
+    holds_url,
+    login_url,
 )
 
 if TYPE_CHECKING:
@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = datetime.timedelta(hours=SCAN_INTERVAL_HOURS)
-
 OPEN_LIBRARY_COVER = "https://covers.openlibrary.org/b/isbn/{isbn}-M.jpg"
 
 
@@ -126,10 +125,41 @@ def _extract_image_url(brief: dict[str, Any]) -> tuple[str | None, str | None]:
     return isbn, image_url
 
 
-class KitsapLibraryClient:
-    """Async HTTP client for the BiblioCommons API."""
+async def async_fetch_library_name(subdomain: str) -> str:
+    """Try to extract the library's display name from its BiblioCommons login page.
 
-    def __init__(self, username: str, password: str) -> None:
+    Falls back to a title-cased version of the subdomain if parsing fails.
+    """
+    url = login_url(subdomain)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params={"destination": "x"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return subdomain.upper()
+                html = await resp.text()
+
+        # BiblioCommons embeds the library name in JS: e.g. "library":{"name":"Kitsap Regional Library"}
+        match = re.search(r'"library"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"', html)
+        if match:
+            return match.group(1)
+
+        # Fall back to the page <title>, which is usually "Library Name - Catalog"
+        title_match = re.search(r"<title>([^<]+)</title>", html)
+        if title_match:
+            title = title_match.group(1).split(" - ")[0].strip()
+            if title:
+                return title
+    except Exception:  # noqa: BLE001
+        pass
+
+    return subdomain.upper()
+
+
+class BiblioCommonsClient:
+    """Async HTTP client for the BiblioCommons gateway API."""
+
+    def __init__(self, subdomain: str, username: str, password: str) -> None:
+        self._subdomain = subdomain
         self._username = username
         self._password = password
         self._session: aiohttp.ClientSession | None = None
@@ -139,20 +169,18 @@ class KitsapLibraryClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            jar = aiohttp.CookieJar()
-            self._session = aiohttp.ClientSession(cookie_jar=jar)
+            self._session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
         return self._session
 
     async def authenticate(self) -> None:
-        """Authenticate with Kitsap Regional Library BiblioCommons portal."""
+        """Authenticate via the BiblioCommons patron portal."""
         session = await self._get_session()
+        url = login_url(self._subdomain)
 
-        # Step 1: Get the login page and extract the CSRF token
-        async with session.get(LOGIN_URL, params={"destination": "x"}) as resp:
+        # Step 1: Fetch login page to get CSRF token
+        async with session.get(url, params={"destination": "x"}) as resp:
             if resp.status != 200:
-                raise ConfigEntryAuthFailed(
-                    f"Login page returned HTTP {resp.status}"
-                )
+                raise ConfigEntryAuthFailed(f"Login page returned HTTP {resp.status}")
             html = await resp.text()
 
         match = re.search(
@@ -160,37 +188,37 @@ class KitsapLibraryClient:
         )
         if not match:
             raise ConfigEntryAuthFailed(
-                "Could not find authenticity_token on login page"
+                "Could not find authenticity_token on login page. "
+                "Check that the library subdomain is correct."
             )
         auth_token = match.group(1)
 
         # Step 2: POST credentials
-        data = {
-            "authenticity_token": auth_token,
-            "name": self._username,
-            "user_pin": self._password,
-        }
-        async with session.post(LOGIN_URL, data=data, allow_redirects=True) as resp:
+        async with session.post(
+            url,
+            data={
+                "authenticity_token": auth_token,
+                "name": self._username,
+                "user_pin": self._password,
+            },
+            allow_redirects=True,
+        ) as resp:
             if resp.status != 200:
-                raise ConfigEntryAuthFailed(
-                    f"Login POST returned HTTP {resp.status}"
-                )
+                raise ConfigEntryAuthFailed(f"Login POST returned HTTP {resp.status}")
 
-        # Step 3: Extract tokens from cookies
+        # Step 3: Extract session tokens from cookies
         cookies = {c.key: c.value for c in session.cookie_jar}
         access_token = cookies.get("bc_access_token")
         session_id = cookies.get("session_id")
 
         if not access_token or not session_id:
             raise ConfigEntryAuthFailed(
-                "Authentication failed: credentials may be incorrect"
+                "Authentication failed — credentials may be incorrect."
             )
 
         self._access_token = access_token
         self._session_id = session_id
-        # Account ID is derived from the session ID per BiblioCommons convention
         self._account_id = int(session_id.split("-")[-1]) + 1
-
         _LOGGER.debug("Authenticated as account_id=%s", self._account_id)
 
     def _api_headers(self) -> dict[str, str]:
@@ -200,7 +228,7 @@ class KitsapLibraryClient:
         }
 
     async def _get_json(self, url: str) -> dict[str, Any] | None:
-        """GET a gateway URL, re-authenticating once on 401."""
+        """GET a gateway endpoint, re-authenticating once on 401."""
         if self._account_id is None:
             await self.authenticate()
 
@@ -226,15 +254,15 @@ class KitsapLibraryClient:
 
     async def get_checkouts(self, assignments: dict[str, str]) -> list[LibraryItem]:
         """Fetch current checkouts and merge in household assignments."""
-        data = await self._get_json(CHECKOUTS_URL)
+        data = await self._get_json(checkouts_url(self._subdomain))
         return _parse_checkouts(data or {}, assignments)
 
     async def get_holds(self) -> list[LibraryHold]:
         """Fetch current holds. Returns empty list if endpoint unavailable."""
         try:
-            data = await self._get_json(HOLDS_URL)
+            data = await self._get_json(holds_url(self._subdomain))
         except (aiohttp.ClientError, asyncio.TimeoutError):
-            _LOGGER.debug("Holds endpoint unavailable")
+            _LOGGER.debug("Holds endpoint unavailable for %s", self._subdomain)
             return []
         return _parse_holds(data or {})
 
@@ -307,13 +335,13 @@ def _parse_holds(data: dict[str, Any]) -> list[LibraryHold]:
     return holds
 
 
-class KitsapLibraryCoordinator(DataUpdateCoordinator[LibraryData]):
-    """Coordinator that polls the library API on a schedule."""
+class BiblioCommonsCoordinator(DataUpdateCoordinator[LibraryData]):
+    """Coordinator that polls the BiblioCommons API on a schedule."""
 
     def __init__(
         self,
         hass: HomeAssistant,
-        client: KitsapLibraryClient,
+        client: BiblioCommonsClient,
         assignment_store: AssignmentStore,
     ) -> None:
         super().__init__(
@@ -339,7 +367,7 @@ class KitsapLibraryCoordinator(DataUpdateCoordinator[LibraryData]):
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise UpdateFailed(f"Network error: {exc}") from exc
 
-        # Clean up assignments for books that have been returned
+        # Clean up assignments for returned books
         active_ids = {item.checkout_id for item in checkouts}
         await self.assignment_store.async_cleanup(active_ids)
 
