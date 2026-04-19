@@ -21,7 +21,7 @@ from .storage import AssignmentStore
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.SELECT]
 
 SERVICE_ASSIGN_ITEM = "assign_item"
 SERVICE_UNASSIGN_ITEM = "unassign_item"
