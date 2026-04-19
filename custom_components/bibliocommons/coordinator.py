@@ -173,38 +173,73 @@ class BiblioCommonsClient:
         return self._session
 
     async def authenticate(self) -> None:
-        """Authenticate via the BiblioCommons patron portal."""
+        """Authenticate via the BiblioCommons patron portal.
+
+        Raises ConfigEntryAuthFailed for bad credentials or an unknown subdomain.
+        Raises UpdateFailed for transient network problems so the coordinator
+        retries on the next interval rather than disabling the integration.
+        """
         session = await self._get_session()
         url = login_url(self._subdomain)
 
         # Step 1: Fetch login page to get CSRF token
-        async with session.get(url, params={"destination": "x"}) as resp:
-            if resp.status != 200:
-                raise ConfigEntryAuthFailed(f"Login page returned HTTP {resp.status}")
-            html = await resp.text()
+        try:
+            async with session.get(
+                url,
+                params={"destination": "x"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    # A bad subdomain typically returns 404/301 — treat as
+                    # a permanent configuration error.
+                    raise ConfigEntryAuthFailed(
+                        f"Login page returned HTTP {resp.status}. "
+                        "Check that the library subdomain is correct."
+                    )
+                html = await resp.text()
+        except ConfigEntryAuthFailed:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # Transient connectivity failure — keep old data and retry later.
+            raise UpdateFailed(f"Cannot reach login page: {exc}") from exc
 
-        match = re.search(
-            r'<input[^>]+name="authenticity_token"[^>]+value="([^"]+)"', html
-        )
-        if not match:
+        # BiblioCommons occasionally reorders HTML attributes; try both orderings.
+        auth_token: str | None = None
+        for pattern in (
+            r'<input[^>]+name="authenticity_token"[^>]+value="([^"]+)"',
+            r'<input[^>]+value="([^"]+)"[^>]+name="authenticity_token"',
+        ):
+            m = re.search(pattern, html)
+            if m:
+                auth_token = m.group(1)
+                break
+
+        if not auth_token:
             raise ConfigEntryAuthFailed(
                 "Could not find authenticity_token on login page. "
                 "Check that the library subdomain is correct."
             )
-        auth_token = match.group(1)
 
         # Step 2: POST credentials
-        async with session.post(
-            url,
-            data={
-                "authenticity_token": auth_token,
-                "name": self._username,
-                "user_pin": self._password,
-            },
-            allow_redirects=True,
-        ) as resp:
-            if resp.status != 200:
-                raise ConfigEntryAuthFailed(f"Login POST returned HTTP {resp.status}")
+        try:
+            async with session.post(
+                url,
+                data={
+                    "authenticity_token": auth_token,
+                    "name": self._username,
+                    "user_pin": self._password,
+                },
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    raise ConfigEntryAuthFailed(
+                        f"Login POST returned HTTP {resp.status}"
+                    )
+        except ConfigEntryAuthFailed:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise UpdateFailed(f"Network error during login: {exc}") from exc
 
         # Step 3: Extract session tokens from cookies
         cookies = {c.key: c.value for c in session.cookie_jar}
@@ -356,6 +391,11 @@ class BiblioCommonsCoordinator(DataUpdateCoordinator[LibraryData]):
     async def _async_update_data(self) -> LibraryData:
         assignments = self.assignment_store.all()
         try:
+            # Re-authenticate on every refresh so the session never goes stale.
+            # authenticate() raises UpdateFailed for transient network errors
+            # and ConfigEntryAuthFailed only for bad credentials/subdomain.
+            await self.client.authenticate()
+
             checkouts, holds = await asyncio.gather(
                 self.client.get_checkouts(assignments),
                 self.client.get_holds(),
