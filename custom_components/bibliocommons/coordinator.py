@@ -179,7 +179,14 @@ class BiblioCommonsClient:
         Raises UpdateFailed for transient network problems so the coordinator
         retries on the next interval rather than disabling the integration.
         """
-        session = await self._get_session()
+        # Always start with a fresh, cookie-free session.  If we reuse an
+        # existing authenticated session, BiblioCommons may redirect us to the
+        # account dashboard instead of serving the login form, which causes the
+        # CSRF token extraction to fail.
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+        session = self._session
         url = login_url(self._subdomain)
 
         # Step 1: Fetch login page to get CSRF token
@@ -272,7 +279,10 @@ class BiblioCommonsClient:
 
         async with session.get(url, params=params, headers=self._api_headers()) as resp:
             if resp.status == 401:
+                # authenticate() closes and recreates self._session, so we must
+                # re-fetch the session reference after the call.
                 await self.authenticate()
+                session = await self._get_session()
                 async with session.get(
                     url,
                     params={"accountId": self._account_id},
