@@ -1,11 +1,11 @@
 {
   "domain": "bibliocommons",
   "name": "BiblioCommons Library",
-  "version": "0.4.0",
+  "codeowners": ["@zeddicus76"],
+  "config_flow": true,
   "documentation": "https://github.com/zeddicus76/library/blob/main/README.md",
+  "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/zeddicus76/library/issues",
   "requirements": [],
-  "config_flow": true,
-  "codeowners": [],
-  "iot_class": "cloud_polling"
+  "version": "0.4.0"
 }
