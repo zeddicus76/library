@@ -142,9 +142,8 @@ class NextDueDateSensor(BiblioCommonsSensor):
         return "Next Due Date"
 
     @property
-    def native_value(self) -> str | None:
-        due = self.data.next_due_date
-        return due.isoformat() if due else None
+    def native_value(self) -> datetime.date | None:
+        return self.data.next_due_date
 
     @property
     def entity_picture(self) -> str | None:
@@ -304,9 +303,9 @@ class BookSensor(BiblioCommonsSensor):
         return self._current_item() is not None
 
     @property
-    def native_value(self) -> str | None:
+    def native_value(self) -> datetime.date | None:
         item = self._current_item()
-        return item.due_date.isoformat() if item else None
+        return item.due_date if item else None
 
     @property
     def device_class(self) -> str:
