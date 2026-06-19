@@ -1,4 +1,9 @@
-"""Select entities for assigning checked-out books to household members."""
+"""Select entities for assigning checked-out books to household members.
+
+Uses a fixed number of slot-based entities so that dashboard cards referencing
+these entities never break when books are returned and new ones checked out.
+Each slot reflects the book at that position in the sorted checkout list.
+"""
 from __future__ import annotations
 
 from homeassistant.components.select import SelectEntity
@@ -11,6 +16,7 @@ from .const import CONF_LIBRARY_NAME, CONF_LIBRARY_SUBDOMAIN, CONF_USERNAME, DOM
 from .coordinator import BiblioCommonsCoordinator, LibraryItem
 
 UNASSIGNED = "Unassigned"
+MAX_SLOTS = 10
 
 
 def _person_names(hass: HomeAssistant) -> list[str]:
@@ -34,27 +40,21 @@ async def async_setup_entry(
     library_name = entry.data.get(CONF_LIBRARY_NAME, entry.data[CONF_LIBRARY_SUBDOMAIN].upper())
     username = entry.data[CONF_USERNAME]
 
-    known_checkout_ids: set[str] = set()
-
-    def _add_new_entities() -> None:
-        if coordinator.data is None:
-            return
-        new_entities = []
-        for item in coordinator.data.checkouts:
-            if item.checkout_id not in known_checkout_ids:
-                known_checkout_ids.add(item.checkout_id)
-                new_entities.append(
-                    BookAssignSelect(coordinator, entry, library_name, username, item.checkout_id)
-                )
-        if new_entities:
-            async_add_entities(new_entities)
-
-    _add_new_entities()
-    entry.async_on_unload(coordinator.async_add_listener(_add_new_entities))
+    # Create a fixed set of slot entities upfront. Their entity_ids are stable
+    # regardless of which books are currently checked out.
+    async_add_entities(
+        BookAssignSelect(coordinator, entry, library_name, username, slot_index)
+        for slot_index in range(MAX_SLOTS)
+    )
 
 
 class BookAssignSelect(CoordinatorEntity[BiblioCommonsCoordinator], SelectEntity):
-    """Dropdown to assign a checked-out book to a household member."""
+    """Dropdown to assign a checked-out book slot to a household member.
+
+    The slot reflects the book at position ``slot_index`` in the coordinator's
+    sorted checkout list. When no book occupies the slot the entity is
+    unavailable, but its entity_id never changes.
+    """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:account-heart"
@@ -65,11 +65,12 @@ class BookAssignSelect(CoordinatorEntity[BiblioCommonsCoordinator], SelectEntity
         entry: ConfigEntry,
         library_name: str,
         username: str,
-        checkout_id: str,
+        slot_index: int,
     ) -> None:
         super().__init__(coordinator)
-        self._checkout_id = checkout_id
-        self._attr_unique_id = f"{entry.entry_id}_assign_{checkout_id}"
+        self._slot_index = slot_index
+        # Stable unique_id based on slot position, not checkout_id.
+        self._attr_unique_id = f"{entry.entry_id}_assign_slot_{slot_index}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id)},
             "name": f"{library_name} – {username}",
@@ -79,18 +80,20 @@ class BookAssignSelect(CoordinatorEntity[BiblioCommonsCoordinator], SelectEntity
         }
 
     def _current_item(self) -> LibraryItem | None:
+        """Return the book occupying this slot, or None if the slot is empty."""
         if self.coordinator.data is None:
             return None
-        return next(
-            (i for i in self.coordinator.data.checkouts if i.checkout_id == self._checkout_id),
-            None,
-        )
+        checkouts = self.coordinator.data.checkouts
+        if self._slot_index < len(checkouts):
+            return checkouts[self._slot_index]
+        return None
 
     @property
     def name(self) -> str:
         item = self._current_item()
-        title = item.title if item else f"Book {self._checkout_id}"
-        return f"{title} – Assigned To"
+        if item:
+            return f"{item.title} – Assigned To"
+        return f"Book Slot {self._slot_index + 1} – Assigned To"
 
     @property
     def available(self) -> bool:
@@ -108,8 +111,11 @@ class BookAssignSelect(CoordinatorEntity[BiblioCommonsCoordinator], SelectEntity
         return UNASSIGNED
 
     async def async_select_option(self, option: str) -> None:
+        item = self._current_item()
+        if item is None:
+            return
         if option == UNASSIGNED:
-            await self.coordinator.assignment_store.async_unassign(self._checkout_id)
+            await self.coordinator.assignment_store.async_unassign(item.checkout_id)
         else:
-            await self.coordinator.assignment_store.async_assign(self._checkout_id, option)
+            await self.coordinator.assignment_store.async_assign(item.checkout_id, option)
         await self.coordinator.async_refresh()
